@@ -73,9 +73,8 @@ Edit `agent.py` to:
 
 ## Future Work
 - [ ] Add real camera input
-- [ ] Integrate ROS/MoveIt
-- [ ] Add collision detection
-- [ ] Implement grasp quality scoring
+- [ ] Integrate with Franka Emika
+- [ ] Test and to end
 
 ## License
 MIT
