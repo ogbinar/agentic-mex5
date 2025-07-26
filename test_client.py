@@ -1,68 +1,140 @@
 import requests
+import cv2
+import numpy as np
+import json
+from typing import Dict, Any
 
-# URL of your running MCP server
-device_url = "http://localhost:8000"
+# Configuration
+TARGET_CLASS = "remote"
+Y_LIMITS = [-0.33, 0.33]
+X_LIMITS = [0.31, 0.57]
+MCP_SERVER_URL = "http://localhost:8000/"
 
-def call_tool(tool_name: str, arguments: dict) -> dict:
-    url = f"{device_url}/mcp/tool/{tool_name}"
-    headers = {
-        "Content-Type": "application/json",
-        # 👇 add text/event-stream to satisfy the spec
-        "Accept": "application/json, text/event-stream",
+def call_tool(tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronous tool caller with proper JSON-RPC formatting"""
+    payload = {
+        "jsonrpc": "2.0",
+        "method": tool_name,
+        "params": params,
+        "id": 1  # Simple static ID for synchronous calls
     }
-    resp = requests.post(url, json=arguments, headers=headers)
-    resp.raise_for_status()
-    return resp.json()
+    
+    try:
+        response = requests.post(
+            MCP_SERVER_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        response.raise_for_status()
+        return response.json().get("result", {})
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling {tool_name}: {str(e)}")
+        raise
 
 def run_pipeline():
-    # Configuration
-    TARGET_CLASS = "remote"
-    Y_LIMITS = [-0.33, 0.33]
-    X_LIMITS = [0.31, 0.57]
+    try:
+        # 1. Capture frame
+        print("Capturing frame...")
+        frame_data = call_tool("capture_frame_realsense", {})
+        
+        # 2. Load inputs
+        print("Loading image data...")
+        loaded_data = call_tool("load_inputs", {
+            "image_path": frame_data.get("image_path"),
+            "depth_path": frame_data.get("depth_path")
+        })
+        img = loaded_data.get("img")
+        depth = loaded_data.get("depth")
+        img_shape = img.shape if img is not None else (480, 640, 3)  # Default shape
 
-    # 1. Capture frame
-    paths = call_tool("capture_frame", {})
+        # 3. Detect object
+        print("Detecting target object...")
+        detection = call_tool("detect_object", {
+            "img": img.tolist() if img is not None else [],  # Convert numpy to list for JSON
+            "target_class": TARGET_CLASS
+        })
+        bbox = detection.get("bbox")
 
-    # 2. Load inputs
-    data = call_tool("load_inputs", paths)
-    img = data["img"] if "img" in data else None
-    depth = data["depth"] if "depth" in data else None
+        # 4. Segment object
+        print("Segmenting object...")
+        segmentation = call_tool("segment_object", {
+            "img": img.tolist(),
+            "bbox": bbox
+        })
+        mask = np.array(segmentation.get("mask")) if segmentation.get("mask") else None
 
-    # 3. Detect object
-    det = call_tool("detect_object", {"img": img, "target_class": TARGET_CLASS})
-    bbox = det.get("bbox")
+        # 5. Compute grasp geometry
+        print("Calculating grasp...")
+        grasp = call_tool("compute_grasp_geometry", {
+            "mask": mask.tolist() if mask is not None else []
+        })
+        coords = {
+            "target": grasp.get("center"),
+            "angle": grasp.get("angle")
+        }
 
-    # 4. Segment object
-    seg = call_tool("segment_object", {"img": img, "bbox": bbox})
-    mask = seg.get("mask")
+        # 6. Detect container
+        print("Finding container...")
+        container = call_tool("detect_container", {"img": img.tolist()})
+        coords["container"] = container.get("container")
 
-    # 5. Compute grasp geometry
-    grasp = call_tool("compute_grasp_geometry", {"mask": mask})
-    coords = {"target": grasp.get("center"), "angle": grasp.get("angle")}
+        # 7. Compute depths
+        print("Calculating depths...")
+        depths = call_tool("compute_midpoint", {
+            "depth": depth.tolist() if depth is not None else [],
+            "coords": coords
+        })
 
-    # 6. Detect container
-    cont = call_tool("detect_container", {"img": img})
-    coords["container"] = cont.get("container")
+        # 8. Convert pixels to world coordinates
+        print("Mapping to world coordinates...")
+        wt = call_tool("pixel_to_world", {
+            "pixel": coords["target"],
+            "y_limits": Y_LIMITS,
+            "x_limits": X_LIMITS,
+            "img_shape": list(img_shape)
+        })
+        wc = call_tool("pixel_to_world", {
+            "pixel": coords["container"],
+            "y_limits": Y_LIMITS,
+            "x_limits": X_LIMITS,
+            "img_shape": list(img_shape)
+        })
+        
+        # Start position (image center)
+        start_px = [img_shape[1]//2, img_shape[0]//2]
+        ws = call_tool("pixel_to_world", {
+            "pixel": start_px,
+            "y_limits": Y_LIMITS,
+            "x_limits": X_LIMITS,
+            "img_shape": list(img_shape)
+        })
 
-    # 7. Compute depths
-    depths = call_tool("compute_midpoint", {"depth": depth, "coords": coords})
+        # 9. Plan trajectory
+        print("Planning trajectory...")
+        plan = call_tool("plan_pick", {
+            "world_start": ws.get("world_xy"),
+            "world_target": wt.get("world_xy"),
+            "mid_depth": depths.get("mid_depth"),
+            "angle": coords.get("angle")
+        })
+        trajectory = plan.get("trajectory")
 
-    # 8. Pixel to world for target and container
-    wt = call_tool("pixel_to_world", {"pixel": coords["target"], "y_limits": Y_LIMITS, "x_limits": X_LIMITS, "img_shape": data["img_shape"]})
-    wc = call_tool("pixel_to_world", {"pixel": coords["container"], "y_limits": Y_LIMITS, "x_limits": X_LIMITS, "img_shape": data["img_shape"]})
-    # Start at image center
-    img_shape = data.get("img_shape", img.shape)
-    start_px = [img_shape[1]//2, img_shape[0]//2]
-    ws = call_tool("pixel_to_world", {"pixel": start_px, "y_limits": Y_LIMITS, "x_limits": X_LIMITS, "img_shape": img_shape})
+        # 10. Execute motion
+        print("Executing motion...")
+        result = call_tool("execute_motion", {"trajectory": trajectory})
+        print("Pipeline completed successfully!")
+        print("Final result:", result)
 
-    # 9. Plan trajectory
-    plan = call_tool("plan_pick", {"world_start": ws["world_xy"], "world_target": wt["world_xy"], "mid_depth": depths.get("mid_depth"), "angle": coords.get("angle")})
-    trajectory = plan.get("trajectory")
-
-    # 10. Execute motion
-    result = call_tool("execute_motion", {"trajectory": trajectory})
-    print("Pipeline result:", result)
-
+    except Exception as e:
+        print(f"Pipeline failed: {str(e)}")
+        return None
 
 if __name__ == "__main__":
-    run_pipeline()
+    # Simple test first
+    print("Testing frame capture...")
+    test_data = call_tool("capture_frame_realsense", {})
+    print("Test frame paths:", test_data)
+    
+    # Full pipeline
+    #if input("Run full pipeline? (y/n): ").lower() == "y":
+    #    run_pipeline()
