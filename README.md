@@ -1,7 +1,12 @@
+
+
+
+```bash
 myk@jupiter00:/projects/agentic-mex5$ uv run mcp_server.py
 Using CPython 3.11.13
 Creating virtual environment at: .venv
-░░░░░░░░░░░░░░░░░░░░ [0/113] Installing wheels...                                                     warning: Failed to hardlink files; falling back to full copy. This may lead to degraded performance.
+░░░░░░░░░░░░░░░░░░░░ [0/113] Installing wheels...                                                     
+warning: Failed to hardlink files; falling back to full copy. This may lead to degraded performance.
          If the cache and target directories are on different filesystems, hardlinking may not be supported.
          If this is intentional, set `export UV_LINK_MODE=copy` or use `--link-mode=copy` to suppress this warning.
 Installed 113 packages in 1m 00s
@@ -11,9 +16,9 @@ INFO:     Started server process [1533336]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+```
 
-
-
+```bash
 myk@jupiter00:/projects/agentic-mex5$ uv run test_client.py
 Capturing frame…
 Running in test mode, skipping RealSense capture.
@@ -47,3 +52,4 @@ Executing motion…
 Running in test mode, skipping actual motion execution.
 Done: {'success': True}
 Saved overlay illustration to trajectory_overlay.png
+```
