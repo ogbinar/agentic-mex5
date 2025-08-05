@@ -1,108 +1,98 @@
+#agent.py
 
-# agent.py
+from mcp import StdioServerParameters
+from smolagents import ToolCollection, LiteLLMModel, ToolCallingAgent
 
-from smolagents import ToolCollection, ToolCallingAgent, LiteLLMModel
-from smolagents.agents import PromptTemplates
-
+# Server connection parameters
 server = {"url": "http://localhost:8000/mcp", "transport": "streamable-http"}
 
+# Load tools from MCP server
 with ToolCollection.from_mcp(server, trust_remote_code=True) as tc:
+    # Initialize LLM model
     model = LiteLLMModel(
-        #model_id="ollama/qwen3:4b",
-        #api_base="http://localhost:11434",
         model_id="ollama/qwen3:8b",
         api_base="http://202.92.159.241:11434",
         temperature=0.2,
     )
 
-    system_prompt = """
-You are an autonomous pick‑and‑place agent. You have these tools:
+    # Print available tools
+    import pprint
+    print("Available tools:")
+    pprint.pprint([tool.name for tool in tc.tools])
 
-1. capture_frame() → { "image_path", "depth_path" }  
-2. load_inputs(image_path, depth_path) → { "img", "depth" }  
-3. detect_object(img, target_class) → { "bbox", "cls" }  
-4. segment_object(img, bbox) → { "mask" }  
-5. compute_grasp_geometry(mask) → { "center": [px,py], "angle", "width" }  
-6. detect_container(img) → { "container": [px,py] }  
-7. compute_midpoint(depth, { "target": center, "container": container })  
-   → { "pickup_depth", "drop_depth", "mid_depth" }  
-8. pixel_to_world(center, y_limits, x_limits, img_shape)  
-   → { "world_xy": [x,y] }  
-9. pixel_to_world(container, y_limits, x_limits, img_shape)  
-   → { "world_xy": [x,y] }  
-10. plan_pick(world_start, world_target, mid_depth, angle)  
-    → { "trajectory": […] }  
-11. execute_motion(trajectory) → { "success" }
+    # Create ToolCallingAgent with custom system prompt
+    agent = ToolCallingAgent(
+        tools=[*tc.tools],
+        model=model,
 
-**Flow rules**  
-- Always begin with **(1) capture_frame** and **(2) load_inputs**.  
-- Then:  
-  1. **detect_object** → **segment_object** → **compute_grasp_geometry**  
-  2. **detect_container**  
-  3. **compute_midpoint**  
-  4. Two calls to **pixel_to_world** (for object **center** and for **container**)  
-  5. Derive **world_start** by pixel_to_world of image center  
-  6. **plan_pick** → **execute_motion**  
-- Pass outputs verbatim from one call to the next.  
-- Do not invent any data.  
-- If **execute_motion** returns `success: false`, you may retry **plan_pick** + **execute_motion**.  
-- End as soon as you achieve `success: true`.
+    )
 
-User: “Pick up the remote control and place it into the container.”
+    # Define detailed system prompt guiding the multi-step workflow
+    system_prompt = '''
+RULE 0: EVERY tool invocation MUST be exactly this JSON, and only this:
+{"name":"<tool_name>","arguments":{…}} 
+RULE 1: **NO tool** may be called more than once.
 
-Respond with a JSON array of tool calls, e.g.:
+RULE 2: You **must** call tools in **this exact** sequence—no reordering, no early exit:
+────────────────────────────────────────────────────────────────────────
 
-```json
-[
-  { "name": "capture_frame", "arguments": {} },
-  { "name": "load_inputs",  "arguments": { "image_path": "...", "depth_path": "..." } },
-  { "name": "detect_object", "arguments": { "img": <img>, "target_class": "remote" } },
-  { "name": "segment_object","arguments": { "img": <img>, "bbox": <bbox> } },
-  { "name": "compute_grasp_geometry", "arguments": { "mask": <mask> } },
-  { "name": "detect_container", "arguments": { "img": <img> } },
-  { "name": "compute_midpoint", "arguments": { "depth": <depth>, "coords": { "target": <center>, "container": <container> } } },
-  { "name": "pixel_to_world","arguments": { "pixel": <center>, "y_limits": [...], "x_limits": [...], "img_shape": [...] } },
-  { "name": "pixel_to_world","arguments": { "pixel": <container>, "y_limits": [...], "x_limits": [...], "img_shape": [...] } },
-  { "name": "plan_pick", "arguments": { "world_start": [...], "world_target": [...], "mid_depth": <mid_depth>, "angle": <angle> } },
-  { "name": "execute_motion","arguments": { "trajectory": <trajectory> } }
-]
+Tool: capture_frame()  
+Example:
+{"name":"capture_frame","arguments":{}}
 
-    """
+Tool: detect_object(img: str|array, target_class: str)  
+Example:
+{"name":"detect_object","arguments":{"img":IMG_PATH,"target_class":"scissor"}}
 
-  
+Tool: segment_object(img: str|array, bbox:[int,int,int,int])  
+Example:
+{"name":"segment_object","arguments":{"img":IMG_PATH,"bbox":[338,62,453,176]}}
 
-    # ----------------- 1. align the prompt with the real tool API -----------------
-    system_prompt = """
-    You are an autonomous pick‑and‑place agent.
+Tool: compute_grasp_geometry()  
+Example:
+{"name":"compute_grasp_geometry","arguments":{}}
 
-    When you reply you must output **exactly one** JSON object with the keys:
-      • "name" – the tool you are calling
-      • "arguments" – a JSON object with the arguments for that tool
+Tool: detect_container(img: str|array)  
+Example:
+{"name":"detect_container","arguments":{"img":IMG_PATH}}
 
-    📌 Never output anything else. No arrays, no prose, no additional keys.
+Tool: compute_midpoint()  
+Example:
+{"name":"compute_midpoint","arguments":{}}
 
-    Available tools:
+Tool: map_pixels_to_world(target_pixel:[int,int],img_path:str)  
+Example:
+{"name":"map_pixels_to_world","arguments":{"target_pixel":[393,109],"img_path":IMG_PATH}}
 
-    1. capture_frame() → {"image_path", "depth_path"}
-    2. load_inputs(image_path, depth_path) → {"img_shape", "depth_shape"}
-    3. detect_object(img_shape, target_class) → {"bbox", "cls"}
-    4. segment_object(mask_shape, bbox) → {"mask_shape"}
-    5. compute_grasp_geometry(mask_shape) → {"center", "angle", "width"}
-    6. detect_container(img_shape) → {"container"}
-    7. compute_midpoint(depth_shape, coords) → {"pickup_depth", "drop_depth", "mid_depth"}
-    8. pixel_to_world(pixel, y_limits, x_limits, img_shape) → {"world_xy"}
-    9. plan_pick(world_start, world_target, mid_depth, angle) → {"trajectory"}
-    10. execute_motion(trajectory) → {"success", "trajectory"}
-    11. final_answer(message) → {"message"}   <-- **include it!**
+Tool: plan_pick(world_start:[float,float],world_target:[float,float],mid_depth:float,angle:float)  
+Example:
+{"name":"plan_pick","arguments":{"world_start":[0.44,0.0],"world_target":[0.511,0.0753],"mid_depth":0.016,"angle":-33.16}}
 
-    **Flow**
-    - Start with capture_frame → load_inputs …
-    - Stop after execute_motion returns `"success": true`, then call final_answer with a short success message.
-    """
-    
- 
+Tool: execute_motion(trajectory:[{"x":float,"y":float,"z":float,"angle":float},…])  
+Example:
+{"name":"execute_motion","arguments":{"trajectory":[{"x":0.44,"y":0.0,"z":0.116,"angle":0.0},{"x":0.511,"y":0.0753,"z":0.116,"angle":-33.16},{"x":0.511,"y":0.0753,"z":0.016,"angle":-33.16}]}}
 
-    agent = ToolCallingAgent(tools=[*tc.tools], model=model)
+NOTE: All arrays must be native JSON arrays (no quotes).
+
+Tool: visualize_trajectory(
+    img_path:str,
+    start_pt:[int,int],
+    target_pt:[int,int],
+    container_pt?:[int,int],
+    output_path:str
+)  
+Example:
+{"name":"visualize_trajectory","arguments":{"img_path":IMG_PATH,"start_pt":[320,240],"target_pt":[393,109],"container_pt":[125,135],"output_path":"trajectory_overlay.png"}}
+
+Tool: final_answer(answer:str)  
+Example:
+{"name":"final_answer","arguments":{"answer":"Picked successfully."}}
+
+NOTE: the "answer" field is REQUIRED and must be non-empty.
+──────────────────────────────────────────────────────────────────────── 
+
+'''  
     agent.prompt_templates["system_prompt"] = system_prompt
 
-    print(agent.run("Pick up the remote control and place it in the container"))
+    # Launch the agent with an initial user query
+    agent.run("Can you locate, grasp, and pick the marker pen from the scene?")

@@ -1,217 +1,115 @@
-# test_client.py
-
 import asyncio
-import numpy as np
 from fastmcp import Client
-from mcp_server import mcp   # your FastMCP app
-
-# Pipeline configuration
-TARGET_CLASS = "Permanent marker"
-TARGET_CLASS = "remote control"
-TARGET_CLASS = "scissor"
-Y_LIMITS = [-0.33, 0.33]
-X_LIMITS = [0.31, 0.57]
-
-import cv2
+from mcp_server import mcp   # ensure mcp_server.py doesn't auto-run the server on import
 import numpy as np
 
-def draw_dotted_arrow(img, start, end, color=(255, 0, 255), thickness=2, gap=20, head_len=20):
-    """
-    Draws a dotted line with arrowhead from `start` to `end`.
-    """
-    vec = np.subtract(end, start)
-    length = int(np.hypot(*vec))
-    if length < 1:
-        return
-    unit = vec / length
-    # dotted shaft
-    for d in range(0, length, gap):
-        pt0 = (start + unit * d).astype(int)
-        pt1 = (start + unit * min(d + gap//2, length)).astype(int)
-        cv2.line(img, tuple(pt0), tuple(pt1), color, thickness)
-    # arrowhead
-    angle = np.arctan2(vec[1], vec[0])
-    for sign in (-1, 1):
-        arrow = (
-            end - head_len * np.array([
-                np.cos(angle + sign * np.pi/6),
-                np.sin(angle + sign * np.pi/6)
-            ])
-        ).astype(int)
-        cv2.line(img, tuple(end), tuple(arrow), color, thickness)
-
-def illustrate_trajectory(
-    img: np.ndarray,
-    start_pt: tuple[int,int],
-    target_pt: tuple[int,int],
-    container_pt: tuple[int,int] | None = None,
-    waypoints: list[tuple[float,float]] | None = None,
-    output_path: str = "trajectory_overlay.png"
-):
-    """
-    Draws start/target/container and arrows onto `img`, then saves to `output_path`.
-
-    - start_pt:    (x,y) of image-center or robot-home.
-    - target_pt:   (x,y) of detected object.
-    - container_pt:(x,y) of drop location, or None.
-    - waypoints:   optional list of (x,y) stages you want to visualize.
-    """
-    overlay = img.copy()
-    h, w = img.shape[:2]
-
-    # 1) draw start
-    cv2.circle(overlay, start_pt, 8, (255,0,255), -1)
-
-    # 2) draw target
-    cv2.circle(overlay, target_pt, 8, (0,255,255), -1)
-
-    # 3) draw container if present
-    if container_pt is not None:
-        cv2.circle(overlay, container_pt, 8, (0,255,0), -1)
-
-    # 4) arrows: start → target, target → container
-    draw_dotted_arrow(overlay, start_pt, target_pt)
-    if container_pt is not None:
-        draw_dotted_arrow(overlay, target_pt, container_pt, color=(0,255,0))
-
-    # 5) waypoints if any
-    if waypoints:
-        for wp in waypoints:
-            pt = (int(wp[0]), int(wp[1]))
-            cv2.circle(overlay, pt, 5, (255,255,0), -1)
-
-    # blend with original
-    output = cv2.addWeighted(img, 0.7, overlay, 0.3, 0)
-    cv2.imwrite(output_path, output)
-    print(f"Saved overlay illustration to {output_path}")
-    return output_path
+# Choose the class you want to pick
+TARGET_CLASS = "remote control"
+# TARGET_CLASS = "scissor"
+# TARGET_CLASS = "Permanent marker"
 
 
 async def run_pipeline():
     async with Client(mcp) as client:
-        # 1. Capture frame
-        print("Capturing frame…")
-        frame_res = await client.call_tool("capture_frame_realsense", {})
-        paths = frame_res.data
+        # 1) Capture an RGB + Depth snapshot (server returns file paths)
+        print("1) Capturing frame…")
+        cap_res = await client.call_tool("capture_frame", {})
+        paths = cap_res.data
         image_path = paths["image_path"]
         depth_path = paths["depth_path"]
+        print(f"   → image: {image_path}")
+        print(f"   → depth: {depth_path}")
 
-
-
-        # 2. Load inputs
-        print("Loading image data…")
-        load_res = await client.call_tool("load_inputs", {
-            "image_path": image_path,
-            "depth_path": depth_path
-        })
-        # Convert back into numpy arrays
-        img = np.array(load_res.data["img"], dtype=np.uint8)
-        depth = np.array(load_res.data["depth"], dtype=float)
-        img_shape = img.shape
-                # After loading the image:
-        h, w = img.shape[:2]
-        start_px = (w // 2, h // 2)
-
-        coords = {}
-
-
-        # 3. Detect object
-        print("Detecting target object…")
-        print("  → target class:", TARGET_CLASS)
+        # 2) Detect the target object (pass the image path to avoid huge payloads)
+        print("2) Detecting target object…")
         det_res = await client.call_tool("detect_object", {
-            "img": img.tolist(),
-            "target_class": TARGET_CLASS
+            "target_class": TARGET_CLASS,
+            "img": image_path
         })
         bbox = det_res.data["bbox"]
-        print("  → bbox:", bbox)
+        cls_name = det_res.data["cls"]
+        print(f"   → detected: {cls_name}, bbox={bbox}")
+        if bbox is None:
+            print("   ! No target detected, aborting.")
+            return
 
-        # 4. Segment object
-        print("Segmenting object…")
+        # 3) Segment the detected object (saves mask + metadata server-side)
+        print("3) Segmenting object…")
         seg_res = await client.call_tool("segment_object", {
-            "img": img.tolist(),
-            "bbox": bbox
+            "bbox": bbox,
+            "img": image_path
         })
-        mask_list = seg_res.data["mask"]
-        mask = np.array(mask_list, dtype=np.uint8) if mask_list is not None else None
+        print(f"   → {seg_res.data.get('message')} | mask={seg_res.data.get('mask_path')} | meta={seg_res.data.get('meta_path')}")
 
-        # 5. Compute grasp geometry
-        print("Calculating grasp geometry…")
-        grasp_res = await client.call_tool("compute_grasp_geometry", {
-            "mask": mask.tolist() if mask is not None else []
-        })
-        center = grasp_res.data["center"]
-        angle = grasp_res.data["angle"]
-        print(f"  → center={center}, angle={angle}")
-        coords['target'] = center
+        # 4) Compute grasp geometry (reads mask_meta.json on server)
+        print("4) Computing grasp geometry…")
+        grasp_res = await client.call_tool("compute_grasp_geometry", {})
+        center_px = grasp_res.data["center"]            # [x, y] in pixels
+        angle_deg = grasp_res.data["angle"]             # gripper/tool roll
+        width_px  = grasp_res.data["width"]
+        print(f"   → center(px)={center_px}, angle(deg)={angle_deg:.2f}, width(px)={width_px:.2f}")
+        if center_px is None:
+            print("   ! No grasp center computed, aborting.")
+            return
 
-
-
-        # 6. Detect container
-        print("Finding container…")
+        # 5) Detect the container (drop target) from the same image
+        print("5) Detecting container…")
         cont_res = await client.call_tool("detect_container", {
-            "img": img.tolist()
+            "img": image_path
         })
-        container_xy = cont_res.data["container"]
-        coords['container'] = container_xy
+        container_px = cont_res.data.get("container")   # [x, y] or None
+        print(f"   → container(px)={container_px}")
 
-        # 7. Compute depths
-        print("Computing depths…")
-        depths_res = await client.call_tool("compute_midpoint", {
-            "depth": depth.tolist(),
-            "coords": {"target": center, "container": container_xy}
+        # 6) Get an approach depth (server returns a fixed mid-depth for now)
+        print("6) Getting approach depth…")
+        depth_res = await client.call_tool("compute_midpoint", {})
+        mid_depth = depth_res.data["mid_depth"]
+        print(f"   → mid_depth(m)={mid_depth}")
+
+        # 7) Map pixels → world (meters) using the server’s fixed limits
+        #    - returns target_world, center_world, and image_dimensions [H, W]
+        print("7) Mapping pixels to world coords…")
+        map_res = await client.call_tool("map_pixels_to_world", {
+            "target_pixel": center_px,      # [x, y] pixels of grasp center
+            "img_path": image_path
         })
-        mid_depth = depths_res.data["mid_depth"]
+        target_world = map_res.data["target_world"]      # [x, y] meters
+        center_world = map_res.data["center_world"]      # [x, y] meters (image center)
+        dims = map_res.data["image_dimensions"]          # [H, W]
+        H, W = dims
+        start_px = [W // 2, H // 2]                      # image center in pixels
+        print(f"   → target_world(m)={target_world}, center_world(m)={center_world}, dims={dims}")
 
-        # 8. Map pixels → world coords
-        print("Mapping to world coordinates…")
-        wt_res = await client.call_tool("pixel_to_world", {
-            "pixel": center,
-            "y_limits": Y_LIMITS,
-            "x_limits": X_LIMITS,
-            "img_shape": list(img_shape)
-        })
-        world_target = wt_res.data["world_xy"]
-
-        ws_res = await client.call_tool("pixel_to_world", {
-            "pixel": [img_shape[1] // 2, img_shape[0] // 2],
-            "y_limits": Y_LIMITS,
-            "x_limits": X_LIMITS,
-            "img_shape": list(img_shape)
-        })
-        world_start = ws_res.data["world_xy"]
-
-        # 9. Plan trajectory
-        print("Planning trajectory…")
+        # 8) Plan a 3-waypoint pick trajectory in world frame
+        print("8) Planning pick trajectory…")
         plan_res = await client.call_tool("plan_pick", {
-            "world_start": world_start,
-            "world_target": world_target,
+            "world_start": center_world,
+            "world_target": target_world,
             "mid_depth": mid_depth,
-            "angle": angle
+            "angle": float(angle_deg) if angle_deg is not None else 0.0
         })
         trajectory = plan_res.data["trajectory"]
-        
+        print(f"   → trajectory: {trajectory}")
 
-        # 10. Execute motion
-        print("Executing motion…")
+        # 9) Execute motion (no-op if TEST_MODE on server is True)
+        print("9) Executing motion…")
         exec_res = await client.call_tool("execute_motion", {
             "trajectory": trajectory
         })
-        print("Done:", exec_res.data)
+        print(f"   → executed: {exec_res.data['success']}")
 
-        # after you've got:
-        #   img:        original numpy image
-        #   start_px:   (w//2, h//2)
-        #   coords['target'], coords['container']
-        # optional: trajectory list of pixel (x, y) coords
+        # 10) Visualize (server overlays arrows/points on the image)
+        print("10) Visualizing trajectory overlay…")
+        vis_args = {
+            "img_path": image_path,
+            "start_pt": start_px,            # pixel center
+            "target_pt": center_px          # grasp center (pixels)
+        }
+        if container_px is not None:
+            vis_args["container_pt"] = container_px
 
-        illustrate_trajectory(
-            img=img,
-            start_pt=start_px,
-            target_pt=coords['target'],
-            container_pt=coords.get('container'),
-            waypoints=[(int(wp["x"]), int(wp["y"])) for wp in trajectory]  # if you want to overlay the three pick waypoints
-        )
-
+        vis_res = await client.call_tool("visualize_trajectory", vis_args)
+        print(f"   → overlay saved to: {vis_res.data['overlay_path']}")
 
 
 if __name__ == "__main__":
