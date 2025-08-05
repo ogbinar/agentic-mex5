@@ -235,3 +235,9 @@ A few files will be generated:
 
 current problem/s:
 - visualize_trajectory works with test_client.py but is being skipped by agent.py 
+- grasp depth is default to 0.016
+- detect container does not use yolo
+
+deployment:
+- set TEST_MODE to False
+- double check motion server IP
