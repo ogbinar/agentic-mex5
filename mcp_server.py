@@ -1,3 +1,4 @@
+# mcp_server.py
 #!/usr/bin/env python3
 """
 Object Detection and Manipulation Server (MCP)
