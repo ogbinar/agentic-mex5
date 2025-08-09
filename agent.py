@@ -20,7 +20,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run the MCP pick/place agent with a prompt.")
     parser.add_argument("prompt", nargs="?", default=None, help="User prompt to run.")
     parser.add_argument("--prompt-file", help="Read the prompt from a file.")
-    parser.add_argument("--prompt-key", default="0", help="prompts.yaml versions[KEY] to load.")
+    parser.add_argument("--prompt-key", default="1", help="prompts.yaml versions[KEY] to load.")
     parser.add_argument("--model-id", default=os.getenv("MODEL_ID", "ollama/qwen3:8b"))
     parser.add_argument("--api-base", default=os.getenv("OLLAMA_BASE", "http://202.92.159.241:11434"))
     parser.add_argument("--temperature", type=float, default=float(os.getenv("TEMP", "0.0")))
@@ -57,7 +57,12 @@ def main():
             api_base=args.api_base,
             temperature=args.temperature,
             # qwen tool-use likes JSON-style outputs; keep if it works for you
-            model_kwargs={"format": "json"},
+            model_kwargs={
+                "format": "json",   # keep this, we’ll harden around it
+           #     "stream": False,    # IMPORTANT: avoid partial JSON in streams
+           #     "options": {"mirostat": 0, "num_ctx": 8192}
+            },
+            #stop=["```"]            # guard against code fences
         )
 
         agent = ToolCallingAgent(tools=tools, model=model)
@@ -70,4 +75,5 @@ if __name__ == "__main__":
     main()
 
 
-# uv run agent.py "Can you pick the marker pen?"
+#  uv run agent.py "Can you pick the marker pen?"
+#  uv run agent.py --prompt-key 1 --model-id ollama/qwen3:32b   "Can you pick the marker pen?" 
