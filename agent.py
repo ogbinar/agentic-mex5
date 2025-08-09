@@ -1,43 +1,73 @@
-#agent.py
-
-from mcp import StdioServerParameters
+# agent.py
+import os, sys, argparse, yaml
 from smolagents import ToolCollection, LiteLLMModel, ToolCallingAgent
 
-# Server connection parameters
-server = {"url": "http://localhost:8000/mcp", "transport": "streamable-http"}
-
-# Load tools from MCP server
-with ToolCollection.from_mcp(server, trust_remote_code=True) as tc:
-    # Initialize LLM model
-    model = LiteLLMModel(
-        model_id="ollama/qwen3:8b",
-        api_base="http://202.92.159.241:11434",
-        temperature=0.2,
+def load_system_prompt(path: str, key: str):
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            prompts = yaml.safe_load(f) or {}
+        v = prompts.get("versions", {}).get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    # Fallback minimal safety/system constraints
+    return (
+        "You are a tool-using robotic assistant. "
+        "Rules: (1) Call tools with JSON only. (2) Do not invent numbers—use tool outputs. "
+        "(3) Prefer deterministic behavior. (4) Keep answers concise."
     )
 
-    # Print available tools
-    import pprint
-    print("Available tools:")
-    pprint.pprint([tool.name for tool in tc.tools])
+def main():
+    parser = argparse.ArgumentParser(description="Run the MCP pick/place agent with a prompt.")
+    parser.add_argument("prompt", nargs="?", default=None, help="User prompt to run.")
+    parser.add_argument("--prompt-file", help="Read the prompt from a file.")
+    parser.add_argument("--prompt-key", default="0", help="prompts.yaml versions[KEY] to load.")
+    parser.add_argument("--model-id", default=os.getenv("MODEL_ID", "ollama/qwen3:8b"))
+    parser.add_argument("--api-base", default=os.getenv("OLLAMA_BASE", "http://202.92.159.241:11434"))
+    parser.add_argument("--temperature", type=float, default=float(os.getenv("TEMP", "0.0")))
+    parser.add_argument("--mcp-url", default=os.getenv("MCP_URL", "http://localhost:8000/mcp"))
+    parser.add_argument("--mcp-transport", default=os.getenv("MCP_TRANSPORT", "streamable-http"))
+    parser.add_argument("--prompts-yaml", default=os.getenv("PROMPTS_YAML", "prompts.yaml"))
+    args = parser.parse_args()
 
-    # Create ToolCallingAgent with custom system prompt
-    agent = ToolCallingAgent(
-        tools=[*tc.tools],
-        model=model,
+    # Resolve prompt
+    user_prompt = args.prompt
+    if args.prompt_file:
+        with open(args.prompt_file, "r") as f:
+            user_prompt = f.read().strip()
+    if not user_prompt:
+        user_prompt = "Can you locate, grasp, and pick the marker pen from the scene?"
 
-    )
+    # Load system prompt
+    system_prompt = load_system_prompt(args.prompts_yaml, args.prompt_key)
 
-    # Define detailed system prompt guiding the multi-step workflow
-    import yaml
-    yaml_path = "prompts.yaml"
-    with open(yaml_path, 'r') as f:
-            prompts = yaml.safe_load(f)
+    server = {"url": args.mcp_url, "transport": args.mcp_transport}
 
-    
-    # works: 0,1 (stable), 6    
-    system_prompt = prompts['versions'][8]
+    allow = {
+        "capture_frame","detect_object","segment_object","compute_grasp_geometry",
+        "detect_container","compute_midpoint","map_pixels_to_world",
+        "plan_pick","compute_drop_height","plan_place",
+        "execute_pick_and_place","execute_motion","visualize_trajectory","final_answer","echo_tool"
+    }
 
-    agent.prompt_templates["system_prompt"] = system_prompt
+    with ToolCollection.from_mcp(server, trust_remote_code=True) as tc:
+        tools = [t for t in tc.tools if t.name in allow]
 
-    # Launch the agent with an initial user query
-    agent.run("Can you locate, grasp, and pick the marker pen from the scene?")
+        model = LiteLLMModel(
+            model_id=args.model_id,
+            api_base=args.api_base,
+            temperature=args.temperature,
+            # qwen tool-use likes JSON-style outputs; keep if it works for you
+            model_kwargs={"format": "json"},
+        )
+
+        agent = ToolCallingAgent(tools=tools, model=model)
+        agent.prompt_templates["system_prompt"] = system_prompt
+
+        # Fire!
+        agent.run(user_prompt)
+
+if __name__ == "__main__":
+    main()
+
+
+# uv run agent.py "Can you pick the marker pen?"

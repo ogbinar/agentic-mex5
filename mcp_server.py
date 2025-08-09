@@ -20,7 +20,7 @@ from fastmcp import FastMCP
 from ultralytics import YOLOWorld, SAM
 
 # === Configuration ===
-TEST_MODE = True  # Set to False when connected to a real robot server
+TEST_MODE = False  # Set to False when connected to a real robot server
 
 # Predefined world coordinate limits for pixel-to-world mapping
 Y_LIMITS = [-0.33, 0.33]
@@ -63,13 +63,7 @@ class RestClient:
 mcp = FastMCP("Object Detection and Manipulation Server")
 
 # === Tool Definitions ===
-
-@mcp.tool(title="Echo Tool", description="Echos the input text back to the user.")
-def echo_tool(
-    text: str = Field(..., description="The text to echo back to the user.")
-) -> str:
-    return text
-
+ 
 
 @mcp.tool(
     title="Capture Frame",
@@ -135,7 +129,10 @@ def detect_object(
     elif isinstance(img, list):
         img = np.array(img, dtype=np.uint8)
 
-    model = YOLOWorld("/projects/agentic-mex5/models/yolov8x-world.pt")
+    if TEST_MODE:
+        model = YOLOWorld("/projects/agentic-mex5/models/yolov8x-world.pt")
+    else:   
+        model = YOLOWorld("models/yolov8x-world.pt")
     model.set_classes([target_class])
     result = model.predict(img, imgsz=640, conf=0.20)[0]
 
@@ -166,7 +163,11 @@ def segment_object(
     mask_path = "mask.png"
     meta_path = "mask_meta.json"
 
-    sam = SAM("/projects/agentic-mex5/models/sam2.1_l.pt")
+    if TEST_MODE:
+        sam = SAM("/projects/agentic-mex5/models/sam2.1_l.pt")
+    else:   
+        sam = SAM("models/sam2.1_l.pt")
+   
     seg = sam.predict(img, bboxes=[bbox])[0]
     mask = (seg.masks.data[0].cpu().numpy() * 255).astype(np.uint8)
 
@@ -176,7 +177,7 @@ def segment_object(
         "mask": seg.masks.data[0].cpu().numpy().tolist(),
         "image_dimensions": img.shape[:2],
         "model_used": "SAM 2.1 Large",
-        "original_image": "/projects/agentic-mex5/rgb_pic.png"
+        "original_image": "rgb_pic.png"
     }
     with open(meta_path, 'w') as f:
         json.dump(metadata, f, indent=2)
@@ -257,11 +258,17 @@ def map_pixels_to_world(
     h, w = img.shape[:2]
 
     px, py = target_pixel
-    target_y = -(Y_LIMITS[1] - (px / w) * (Y_LIMITS[1] - Y_LIMITS[0]))
-    target_x = X_LIMITS[0] + ((h - py) / h) * (X_LIMITS[1] - X_LIMITS[0])
 
-    center_x = X_LIMITS[0] + ((h - h//2) / h) * (X_LIMITS[1] - X_LIMITS[0])
-    center_y = -(Y_LIMITS[1] - ((w//2) / w) * (Y_LIMITS[1] - Y_LIMITS[0]))
+    # --- Ted calibration (old implementation) ---
+    # px: [0..639] with center ~320; py: [0..479] with top=0
+    # 0.125 cm/px scale, +6.5 cm x-offset; convert to meters.
+    target_y = -((px - 320) * 0.125) / 100.0
+    target_x = (((480 - py) * 0.125) + 6.5) / 100.0
+
+    # Do the same for the image center (px=320, py=240)
+    cpx, cpy = w // 2, h // 2
+    center_y = -((cpx - 320) * 0.125) / 100.0
+    center_x = (((480 - cpy) * 0.125) + 6.5) / 100.0
 
     return {
         "target_world": [round(target_x, 4), round(target_y, 4)],
@@ -277,7 +284,7 @@ def map_pixels_to_world(
 
 @mcp.tool(
     title="Plan Pick Trajectory",
-    description="Generates a three-waypoint approach→align→descend pick trajectory."
+    description="Original flow: hover at 0.49 above target (angle=0), then descend to mid depth with grasp angle."
 )
 def plan_pick(
     world_start: List[float] = Field(..., description="[x,y] at image center in world."),
@@ -285,13 +292,40 @@ def plan_pick(
     mid_depth: float = Field(..., description="Approach depth in meters."),
     angle: float = Field(..., description="Roll angle for gripper in degrees.")
 ) -> Dict[str, Any]:
-    sx, sy = world_start
+    if not (0.0 < mid_depth < 0.1):
+        raise ValueError("mid_depth must come from compute_midpoint() and be < 0.1 m")
+  
     tx, ty = world_target
-    approach_z = mid_depth + 0.1
+    HOVER_Z = 0.49
     trajectory = [
-        {"x": sx, "y": sy, "z": approach_z, "angle": 0.0},
-        {"x": tx, "y": ty, "z": approach_z, "angle": angle},
-        {"x": tx, "y": ty, "z": mid_depth, "angle": angle},
+        {"x": tx, "y": ty, "z": HOVER_Z, "angle": 0.0},      # move above target
+        {"x": tx, "y": ty, "z": mid_depth, "angle": angle},  # descend & rotate once
+    ]
+
+
+    return {"trajectory": trajectory}
+
+
+@mcp.tool(
+    title="Compute Drop Height",
+    description="Returns drop height; mirrors original ~0.49/2 behavior."
+)
+def compute_drop_height() -> Dict[str, float]:
+    return {"drop_mid": 0.245}
+
+@mcp.tool(
+    title="Plan Place Trajectory",
+    description="Hover above drop at 0.49 (angle=0), then descend to drop_mid (angle=0)."
+)
+def plan_place(
+    world_drop: List[float] = Field(..., description="[x,y] mapped from drop pixel."),
+    drop_mid: float = Field(..., description="Drop height in meters.")
+) -> Dict[str, Any]:
+    dx, dy = world_drop
+    HOVER_Z = 0.49
+    trajectory = [
+        {"x": dx, "y": dy, "z": HOVER_Z, "angle": 0.0},   # move above drop
+        {"x": dx, "y": dy, "z": drop_mid, "angle": 0.0},  # descend (no rotation)
     ]
     return {"trajectory": trajectory}
 
@@ -305,14 +339,90 @@ def execute_motion(
 ) -> Dict[str, bool]:
     if TEST_MODE:
         return {"success": True}
+
     client = RestClient(ip="192.168.1.130", port=34568)
+
+    last_angle = 0.0
     for wp in trajectory:
+        desired = float(wp.get("angle", last_angle))
+        delta = desired - last_angle
+        last_angle = desired
+
         resp = client.move_to_cartesian(
-            wp["x"], wp["y"], wp["z"], 5.0, (wp.get("angle", 0.0), 0, 0)
+            wp["x"], wp["y"], wp["z"], 5.0, (delta, 0.0, 0.0)
         )
         if not resp.ok:
             return {"success": False}
+
     return {"success": True}
+
+@mcp.tool(
+    title="Execute Pick and Place",
+    description="Executes pick trajectory, closes gripper, lifts, executes place trajectory, opens gripper, retreats."
+)
+def execute_pick_and_place(
+    pick_traj: List[Dict[str, float]],
+    place_traj: List[Dict[str, float]]
+) -> Dict[str, Any]:
+    print(f"execute_pick_and_place: pick_len={len(pick_traj)}, place_len={len(place_traj)}")
+
+    if TEST_MODE:
+        return {"success": True}
+
+    # Validate inputs early
+    if not pick_traj:
+        return {"success": False, "error": "pick_traj is empty"}
+    if place_traj is None:
+        return {"success": False, "error": "place_traj is None"}
+    if len(place_traj) < 2:
+        return {"success": False, "error": f"place_traj too short: {len(place_traj)} (need 2 waypoints)"}
+
+    HOVER_Z = 0.49
+    client = RestClient(ip="192.168.1.130", port=34568)
+
+    def send_wp(wp, last_angle):
+        desired = float(wp.get("angle", last_angle))
+        delta = desired - last_angle
+        resp = client.move_to_cartesian(wp["x"], wp["y"], wp["z"], 5.0, (delta, 0.0, 0.0))
+        return desired, resp
+
+    # 1) Execute pick
+    last_angle = 0.0
+    for wp in pick_traj:
+        last_angle, resp = send_wp(wp, last_angle)
+        if not resp.ok:
+            return {"success": False, "error": "pick waypoint failed"}
+
+    # 2) Close gripper
+    resp = client.close_gripper()
+    if not resp.ok:
+        return {"success": False, "error": "close_gripper failed"}
+
+    # 3) Lift to hover (angle back to 0.0)
+    last_angle, resp = send_wp({"x": pick_traj[-1]["x"], "y": pick_traj[-1]["y"], "z": HOVER_Z, "angle": 0.0}, last_angle)
+    if not resp.ok:
+        return {"success": False, "error": "lift-to-hover failed"}
+
+    # 4) Place waypoints
+    for wp in place_traj:
+        last_angle, resp = send_wp(wp, last_angle)
+        if not resp.ok:
+            return {"success": False, "error": "place waypoint failed"}
+
+    # 5) Open gripper
+    resp = client.open_gripper()
+    if not resp.ok:
+        return {"success": False, "error": "open_gripper failed"}
+
+    # 6) Retreat to hover at drop (safe even if angle already 0)
+    last = place_traj[-1]
+    _, resp = send_wp({"x": last["x"], "y": last["y"], "z": HOVER_Z, "angle": 0.0}, last_angle)
+    if not resp.ok:
+        return {"success": False, "error": "retreat failed"}
+
+    return {"success": True}
+
+
 
 # === Visualization Helpers ===
 def draw_dotted_arrow(

@@ -1,12 +1,14 @@
+#test_client.py
+
 import asyncio
 from fastmcp import Client
 from mcp_server import mcp   # ensure mcp_server.py doesn't auto-run the server on import
 import numpy as np
 
 # Choose the class you want to pick
-TARGET_CLASS = "remote control"
+# TARGET_CLASS = "remote control"
 # TARGET_CLASS = "scissor"
-# TARGET_CLASS = "Permanent marker"
+TARGET_CLASS = "marker pen"
 
 
 async def run_pipeline():
@@ -91,12 +93,38 @@ async def run_pipeline():
         trajectory = plan_res.data["trajectory"]
         print(f"   → trajectory: {trajectory}")
 
-        # 9) Execute motion (no-op if TEST_MODE on server is True)
-        print("9) Executing motion…")
-        exec_res = await client.call_tool("execute_motion", {
-            "trajectory": trajectory
+        # 8.1) Map container pixel to world (if detected); else bail
+        if container_px is None:
+            print("   ! No container detected, aborting place.")
+            return
+
+        map_drop = await client.call_tool("map_pixels_to_world", {
+            "target_pixel": container_px,
+            "img_path": image_path
+        })
+        drop_world = map_drop.data["target_world"]   # [x,y] in meters
+
+        # 8.2) Get drop height (0.245)
+        drop_h = await client.call_tool("compute_drop_height", {})
+        drop_mid = drop_h.data["drop_mid"]
+
+        # 8.3) Plan place trajectory
+        place_res = await client.call_tool("plan_place", {
+            "world_drop": drop_world,
+            "drop_mid": drop_mid
+        })
+        place_traj = place_res.data["trajectory"]
+        print(f"   → place trajectory: {place_traj}")
+
+
+        # 9) Execute full pick & place
+        print("9) Executing pick & place…")
+        exec_res = await client.call_tool("execute_pick_and_place", {
+            "pick_traj": trajectory,
+            "place_traj": place_traj
         })
         print(f"   → executed: {exec_res.data['success']}")
+
 
         # 10) Visualize (server overlays arrows/points on the image)
         print("10) Visualizing trajectory overlay…")
